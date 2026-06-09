@@ -12,6 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class UdpServerHandler extends SimpleChannelInboundHandler<DatagramPacket> {
 
@@ -19,6 +20,8 @@ public class UdpServerHandler extends SimpleChannelInboundHandler<DatagramPacket
 
     private final BlockingQueue<SonarFrame> frameQueue;
     private final KongsbergRawParser parser;
+    private final AtomicLong droppedFrames = new AtomicLong(0);
+    private final AtomicLong processedFrames = new AtomicLong(0);
 
     public UdpServerHandler(BlockingQueue<SonarFrame> frameQueue) {
         this.frameQueue = frameQueue;
@@ -28,33 +31,49 @@ public class UdpServerHandler extends SimpleChannelInboundHandler<DatagramPacket
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, DatagramPacket packet) {
         ByteBuf buf = packet.content();
-        int length = buf.readableBytes();
+        byte[] data = null;
 
-        if (length < 16) {
-            return;
+        try {
+            int length = buf.readableBytes();
+            if (length < 16) {
+                return;
+            }
+
+            data = new byte[length];
+            buf.getBytes(buf.readerIndex(), data);
+
+            List<DepthPoint> points = parser.parse(data);
+
+            if (points.isEmpty()) {
+                return;
+            }
+
+            SonarFrame frame = new SonarFrame();
+            frame.setTimestamp(System.currentTimeMillis());
+            frame.setPingNumber(extractPingCounter(data));
+            frame.setHeading(0.0);
+            frame.setPoints(points);
+
+            if (!frameQueue.offer(frame)) {
+                long dropped = droppedFrames.incrementAndGet();
+                if (dropped % 1000 == 0) {
+                    logger.warn("UDP frame queue full! Dropped {} frames total, queue size={}",
+                            dropped, frameQueue.size());
+                }
+            } else {
+                long processed = processedFrames.incrementAndGet();
+                if (processed % 10000 == 0) {
+                    logger.info("UDP processed {} frames, queue size={}, dropped={}",
+                            processed, frameQueue.size(), dropped.get());
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing UDP datagram", e);
         }
-
-        byte[] data = new byte[length];
-        buf.readBytes(data);
-
-        List<DepthPoint> points = parser.parse(data);
-
-        if (points.isEmpty()) {
-            return;
-        }
-
-        SonarFrame frame = new SonarFrame();
-        frame.setTimestamp(System.currentTimeMillis());
-        frame.setPingNumber(extractPingCounter(data));
-        frame.setHeading(0.0);
-        frame.setPoints(points);
-
-        frameQueue.offer(frame);
-        logger.debug("Queued sonar frame: ping={}, points={}", frame.getPingNumber(), points.size());
     }
 
     private int extractPingCounter(byte[] data) {
-        if (data.length < 7) {
+        if (data == null || data.length < 7) {
             return 0;
         }
         return (data[5] & 0xFF) | ((data[6] & 0xFF) << 8);
