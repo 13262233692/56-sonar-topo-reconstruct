@@ -1,10 +1,13 @@
 import { Matrix4 } from './Matrix4.js'
+import { DelaunayTriangulation } from './DelaunayTriangulation.js'
+import { HoleFiller } from './HoleFiller.js'
 
 const VERT_SHADER = `#version 300 es
 precision highp float;
 
 in vec3 aPosition;
 in float aIntensity;
+in float aIsInterpolated;
 
 uniform mat4 uModel;
 uniform mat4 uView;
@@ -12,12 +15,14 @@ uniform mat4 uProjection;
 
 out float vDepth;
 out float vIntensity;
-out vec2 vGridPos;
+out float vIsInterpolated;
+out vec3 vBarycentric;
 
 void main() {
   vDepth = aPosition.z;
   vIntensity = aIntensity;
-  vGridPos = aPosition.xy;
+  vIsInterpolated = aIsInterpolated;
+  vBarycentric = vec3(0.0);
   gl_Position = uProjection * uView * uModel * vec4(aPosition, 1.0);
 }
 `
@@ -27,7 +32,7 @@ precision highp float;
 
 in float vDepth;
 in float vIntensity;
-in vec2 vGridPos;
+in float vIsInterpolated;
 
 out vec4 fragColor;
 
@@ -48,20 +53,83 @@ vec3 oceanColor(float depth) {
 }
 
 void main() {
-  vec3 baseColor = oceanColor(vDepth);
+  vec3 baseColor = oceanColor(abs(vDepth));
   baseColor *= (0.3 + 0.7 * vIntensity);
 
-  vec2 grid = abs(fract(vGridPos * 2.0 - 0.5) - 0.5);
-  float line = min(grid.x, grid.y);
-  float gridLine = 1.0 - smoothstep(0.0, 0.02, line);
-  baseColor = mix(baseColor, baseColor + vec3(0.08, 0.12, 0.18), gridLine * 0.4);
+  if (vIsInterpolated > 0.5) {
+    baseColor *= 0.85;
+  }
 
   fragColor = vec4(baseColor, 1.0);
 }
 `
 
-const GRID_SIZE = 256
-const VERT_FLOATS = 4
+const WIREFRAME_VERT_SHADER = `#version 300 es
+precision highp float;
+
+in vec3 aPosition;
+in float aIntensity;
+in float aIsInterpolated;
+
+uniform mat4 uModel;
+uniform mat4 uView;
+uniform mat4 uProjection;
+
+out float vDepth;
+out float vIntensity;
+out vec3 vBarycentric;
+
+void main() {
+  vDepth = aPosition.z;
+  vIntensity = aIntensity;
+  int vertIndex = gl_VertexID % 3;
+  if (vertIndex == 0) vBarycentric = vec3(1.0, 0.0, 0.0);
+  else if (vertIndex == 1) vBarycentric = vec3(0.0, 1.0, 0.0);
+  else vBarycentric = vec3(0.0, 0.0, 1.0);
+  gl_Position = uProjection * uView * uModel * vec4(aPosition, 1.0);
+}
+`
+
+const WIREFRAME_FRAG_SHADER = `#version 300 es
+precision highp float;
+
+in float vDepth;
+in float vIntensity;
+in vec3 vBarycentric;
+
+out vec4 fragColor;
+
+vec3 oceanColor(float depth) {
+  if (depth <= 50.0) {
+    float t = depth / 50.0;
+    return mix(vec3(0.0, 0.92, 0.95), vec3(0.0, 0.6, 0.8), t);
+  } else if (depth <= 200.0) {
+    float t = (depth - 50.0) / 150.0;
+    return mix(vec3(0.0, 0.6, 0.8), vec3(0.0, 0.2, 0.5), t);
+  } else if (depth <= 500.0) {
+    float t = (depth - 200.0) / 300.0;
+    return mix(vec3(0.0, 0.2, 0.5), vec3(0.05, 0.05, 0.25), t);
+  } else {
+    float t = clamp((depth - 500.0) / 500.0, 0.0, 1.0);
+    return mix(vec3(0.05, 0.05, 0.25), vec3(0.02, 0.02, 0.1), t);
+  }
+}
+
+void main() {
+  vec3 baseColor = oceanColor(abs(vDepth));
+  baseColor *= (0.3 + 0.7 * vIntensity);
+
+  float edgeFactor = min(min(vBarycentric.x, vBarycentric.y), vBarycentric.z);
+  float wireAlpha = 1.0 - smoothstep(0.0, 0.05, edgeFactor);
+
+  vec3 wireColor = baseColor + vec3(0.15, 0.25, 0.35);
+  baseColor = mix(baseColor * 0.5, wireColor, wireAlpha);
+
+  fragColor = vec4(baseColor, 1.0);
+}
+`
+
+const VERT_FLOATS = 5
 const STRIDE = VERT_FLOATS * 4
 
 export class HeightmapRenderer {
@@ -78,8 +146,18 @@ export class HeightmapRenderer {
     this.running = false
     this._rafId = null
 
+    this._accumulatedPoints = []
+    this._maxAccumulatedPoints = 8000
+    this._frameCount = 0
+    this._triangulationDirty = true
+    this._lastMeshVertices = null
+    this._lastMeshIndices = null
+
+    this._delaunay = new DelaunayTriangulation()
+    this._holeFiller = new HoleFiller()
+
     this._initShaders()
-    this._initGrid()
+    this._initEmptyBuffers()
     this._initCamera()
     this._resize()
   }
@@ -97,91 +175,74 @@ export class HeightmapRenderer {
     return shader
   }
 
-  _initShaders() {
+  _linkProgram(vsSource, fsSource) {
     const gl = this.gl
-    const vs = this._compileShader(VERT_SHADER, gl.VERTEX_SHADER)
-    const fs = this._compileShader(FRAG_SHADER, gl.FRAGMENT_SHADER)
-
-    this.program = gl.createProgram()
-    gl.attachShader(this.program, vs)
-    gl.attachShader(this.program, fs)
-    gl.linkProgram(this.program)
-
-    if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
-      throw new Error('Program link error: ' + gl.getProgramInfoLog(this.program))
+    const vs = this._compileShader(vsSource, gl.VERTEX_SHADER)
+    const fs = this._compileShader(fsSource, gl.FRAGMENT_SHADER)
+    const prog = gl.createProgram()
+    gl.attachShader(prog, vs)
+    gl.attachShader(prog, fs)
+    gl.linkProgram(prog)
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error('Program link error: ' + gl.getProgramInfoLog(prog))
     }
-
     gl.deleteShader(vs)
     gl.deleteShader(fs)
 
-    this.aPosition = gl.getAttribLocation(this.program, 'aPosition')
-    this.aIntensity = gl.getAttribLocation(this.program, 'aIntensity')
-    this.uModel = gl.getUniformLocation(this.program, 'uModel')
-    this.uView = gl.getUniformLocation(this.program, 'uView')
-    this.uProjection = gl.getUniformLocation(this.program, 'uProjection')
+    const result = {
+      program: prog,
+      aPosition: gl.getAttribLocation(prog, 'aPosition'),
+      aIntensity: gl.getAttribLocation(prog, 'aIntensity'),
+      aIsInterpolated: gl.getAttribLocation(prog, 'aIsInterpolated'),
+      uModel: gl.getUniformLocation(prog, 'uModel'),
+      uView: gl.getUniformLocation(prog, 'uView'),
+      uProjection: gl.getUniformLocation(prog, 'uProjection')
+    }
+    return result
   }
 
-  _initGrid() {
-    const gl = this.gl
-    const vertexCount = GRID_SIZE * GRID_SIZE
-    this.vertexData = new Float32Array(vertexCount * VERT_FLOATS)
-    this.vertexCount = vertexCount
+  _initShaders() {
+    this.solidProgram = this._linkProgram(VERT_SHADER, FRAG_SHADER)
+    this.wireProgram = this._linkProgram(WIREFRAME_VERT_SHADER, WIREFRAME_FRAG_SHADER)
+  }
 
-    for (let row = 0; row < GRID_SIZE; row++) {
-      for (let col = 0; col < GRID_SIZE; col++) {
-        const idx = (row * GRID_SIZE + col) * VERT_FLOATS
-        this.vertexData[idx + 0] = (col / (GRID_SIZE - 1)) - 0.5
-        this.vertexData[idx + 1] = (row / (GRID_SIZE - 1)) - 0.5
-        this.vertexData[idx + 2] = 0.0
-        this.vertexData[idx + 3] = 0.5
-      }
-    }
+  _initEmptyBuffers() {
+    const gl = this.gl
 
     this.vbo = gl.createBuffer()
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
-    gl.bufferData(gl.ARRAY_BUFFER, this.vertexData, gl.DYNAMIC_DRAW)
+    gl.bufferData(gl.ARRAY_BUFFER, 1, gl.DYNAMIC_DRAW)
 
-    this.vao = gl.createVertexArray()
-    gl.bindVertexArray(this.vao)
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
-
-    gl.enableVertexAttribArray(this.aPosition)
-    gl.vertexAttribPointer(this.aPosition, 3, gl.FLOAT, false, STRIDE, 0)
-
-    gl.enableVertexAttribArray(this.aIntensity)
-    gl.vertexAttribPointer(this.aIntensity, 1, gl.FLOAT, false, STRIDE, 12)
-
-    this._buildIndexBuffer()
-    gl.bindVertexArray(null)
-  }
-
-  _buildIndexBuffer() {
-    const gl = this.gl
-    const rows = GRID_SIZE - 1
-    const cols = GRID_SIZE - 1
-    const indexCount = rows * cols * 6
-    const indices = new Uint32Array(indexCount)
-
-    let ptr = 0
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
-        const tl = r * GRID_SIZE + c
-        const tr = tl + 1
-        const bl = tl + GRID_SIZE
-        const br = bl + 1
-        indices[ptr++] = tl
-        indices[ptr++] = bl
-        indices[ptr++] = tr
-        indices[ptr++] = tr
-        indices[ptr++] = bl
-        indices[ptr++] = br
-      }
-    }
-
-    this.indexCount = indexCount
     this.ibo = gl.createBuffer()
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo)
-    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, 1, gl.DYNAMIC_DRAW)
+
+    this.solidVao = gl.createVertexArray()
+    gl.bindVertexArray(this.solidVao)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo)
+    gl.enableVertexAttribArray(this.solidProgram.aPosition)
+    gl.vertexAttribPointer(this.solidProgram.aPosition, 3, gl.FLOAT, false, STRIDE, 0)
+    gl.enableVertexAttribArray(this.solidProgram.aIntensity)
+    gl.vertexAttribPointer(this.solidProgram.aIntensity, 1, gl.FLOAT, false, STRIDE, 12)
+    gl.enableVertexAttribArray(this.solidProgram.aIsInterpolated)
+    gl.vertexAttribPointer(this.solidProgram.aIsInterpolated, 1, gl.FLOAT, false, STRIDE, 16)
+    gl.bindVertexArray(null)
+
+    this.wireVao = gl.createVertexArray()
+    gl.bindVertexArray(this.wireVao)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo)
+    gl.enableVertexAttribArray(this.wireProgram.aPosition)
+    gl.vertexAttribPointer(this.wireProgram.aPosition, 3, gl.FLOAT, false, STRIDE, 0)
+    gl.enableVertexAttribArray(this.wireProgram.aIntensity)
+    gl.vertexAttribPointer(this.wireProgram.aIntensity, 1, gl.FLOAT, false, STRIDE, 12)
+    gl.enableVertexAttribArray(this.wireProgram.aIsInterpolated)
+    gl.vertexAttribPointer(this.wireProgram.aIsInterpolated, 1, gl.FLOAT, false, STRIDE, 16)
+    gl.bindVertexArray(null)
+
+    this.indexCount = 0
+    this.vertexCount = 0
   }
 
   _initCamera() {
@@ -192,14 +253,46 @@ export class HeightmapRenderer {
     if (!frame || !frame.points || frame.points.length === 0) return
 
     const points = frame.points
-    const gridExtent = GRID_SIZE - 1
+    this._frameCount++
+
+    const appendCount = Math.min(points.length, this._maxAccumulatedPoints - this._accumulatedPoints.length)
+    for (let i = 0; i < appendCount; i++) {
+      const p = points[i]
+      const intensity = p.intensity !== undefined ? Math.max(0, Math.min(1, (p.intensity + 60) / 60)) : 0.5
+      this._accumulatedPoints.push({
+        x: p.x,
+        y: p.y,
+        z: p.z,
+        intensity: intensity,
+        beamIndex: p.beamIndex !== undefined ? p.beamIndex : i,
+        isInterpolated: false
+      })
+    }
+
+    if (this._accumulatedPoints.length > this._maxAccumulatedPoints) {
+      this._accumulatedPoints = this._accumulatedPoints.slice(
+        this._accumulatedPoints.length - this._maxAccumulatedPoints
+      )
+    }
+
+    this._triangulationDirty = true
+    this._rebuildMesh()
+  }
+
+  _rebuildMesh() {
+    if (!this._triangulationDirty) return
+    if (this._accumulatedPoints.length < 3) return
+
+    this._triangulationDirty = false
+
+    const rawPoints = this._accumulatedPoints
 
     let minX = Infinity, maxX = -Infinity
     let minY = Infinity, maxY = -Infinity
     let maxAbsZ = 0
 
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i]
+    for (let i = 0; i < rawPoints.length; i++) {
+      const p = rawPoints[i]
       if (p.x < minX) minX = p.x
       if (p.x > maxX) maxX = p.x
       if (p.y < minY) minY = p.y
@@ -210,45 +303,40 @@ export class HeightmapRenderer {
 
     const rangeX = maxX - minX || 1
     const rangeY = maxY - minY || 1
+    this._normalization = { minX, minY, rangeX, rangeY, maxAbsZ }
+
     const zScale = maxAbsZ > 0 ? 0.3 / maxAbsZ : 0.001
 
-    for (let i = 0; i < points.length; i++) {
-      const p = points[i]
-      const nx = (p.x - minX) / rangeX
-      const ny = (p.y - minY) / rangeY
-      const gx = Math.round(nx * gridExtent)
-      const gy = Math.round(ny * gridExtent)
+    const gridDensity = Math.max(6, Math.min(20, Math.floor(Math.sqrt(rawPoints.length) / 4)))
+    const filledPoints = this._holeFiller.fill(rawPoints, gridDensity)
 
-      if (gx < 0 || gx >= GRID_SIZE || gy < 0 || gy >= GRID_SIZE) continue
-
-      const depth = p.z
-      const intensity = p.intensity !== undefined ? Math.max(0, Math.min(1, (p.intensity + 60) / 60)) : 0.5
-      const idx = (gy * GRID_SIZE + gx) * VERT_FLOATS
-
-      this.vertexData[idx + 2] = -depth * zScale
-      this.vertexData[idx + 3] = intensity
-
-      const spread = Math.min(2, Math.max(1, Math.floor(gridExtent / 128)))
-      for (let dy = -spread; dy <= spread; dy++) {
-        for (let dx = -spread; dx <= spread; dx++) {
-          if (dx === 0 && dy === 0) continue
-          const nx2 = gx + dx
-          const ny2 = gy + dy
-          if (nx2 < 0 || nx2 >= GRID_SIZE || ny2 < 0 || ny2 >= GRID_SIZE) continue
-          const nidx = (ny2 * GRID_SIZE + nx2) * VERT_FLOATS
-          const w = 1.0 / (1.0 + Math.abs(dx) + Math.abs(dy))
-          const oldZ = this.vertexData[nidx + 2]
-          if (oldZ === 0.0) {
-            this.vertexData[nidx + 2] = -depth * zScale * w
-            this.vertexData[nidx + 3] = intensity * w
-          }
-        }
-      }
+    const normalizedPoints = []
+    for (let i = 0; i < filledPoints.length; i++) {
+      const p = filledPoints[i]
+      normalizedPoints.push({
+        x: (p.x - minX) / rangeX - 0.5,
+        y: (p.y - minY) / rangeY - 0.5,
+        z: -p.z * zScale,
+        intensity: p.intensity !== undefined ? p.intensity : 0.5,
+        isInterpolated: p.isInterpolated === true
+      })
     }
+
+    const mesh = this._delaunay.triangulate(normalizedPoints)
+
+    if (mesh.indices.length === 0) return
+
+    this._lastMeshVertices = mesh.vertices
+    this._lastMeshIndices = mesh.indices
+    this.indexCount = mesh.indices.length
+    this.vertexCount = mesh.vertices.length / VERT_FLOATS
 
     const gl = this.gl
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vbo)
-    gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.vertexData)
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.vertices, gl.DYNAMIC_DRAW)
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo)
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW)
+
     this.dirty = true
   }
 
@@ -293,31 +381,33 @@ export class HeightmapRenderer {
     gl.clearColor(0.039, 0.055, 0.09, 1.0)
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT)
     gl.enable(gl.DEPTH_TEST)
-    gl.enable(gl.CULL_FACE)
-    gl.cullFace(gl.BACK)
-
-    gl.useProgram(this.program)
 
     const projection = Matrix4.perspective(Math.PI / 3, width / height, 0.1, 1000)
     const view = this._computeViewMatrix()
 
-    gl.uniformMatrix4fv(this.uProjection, false, projection.m)
-    gl.uniformMatrix4fv(this.uView, false, view.m)
-    gl.uniformMatrix4fv(this.uModel, false, this.modelMatrix.m)
-
-    gl.bindVertexArray(this.vao)
-
-    if (this.wireframe) {
-      for (let r = 0; r < GRID_SIZE - 1; r++) {
-        const start = r * (GRID_SIZE - 1) * 6
-        const count = (GRID_SIZE - 1) * 6
-        gl.drawElements(gl.LINE_STRIP, count, gl.UNSIGNED_INT, start * 4)
+    if (this.indexCount > 0) {
+      let prog, vao
+      if (this.wireframe) {
+        prog = this.wireProgram
+        vao = this.wireVao
+      } else {
+        prog = this.solidProgram
+        vao = this.solidVao
+        gl.enable(gl.CULL_FACE)
+        gl.cullFace(gl.BACK)
       }
-    } else {
+
+      gl.useProgram(prog.program)
+      gl.uniformMatrix4fv(prog.uProjection, false, projection.m)
+      gl.uniformMatrix4fv(prog.uView, false, view.m)
+      gl.uniformMatrix4fv(prog.uModel, false, this.modelMatrix.m)
+
+      gl.bindVertexArray(vao)
       gl.drawElements(gl.TRIANGLES, this.indexCount, gl.UNSIGNED_INT, 0)
+      gl.bindVertexArray(null)
     }
 
-    gl.bindVertexArray(null)
+    gl.disable(gl.CULL_FACE)
     this._rafId = requestAnimationFrame(() => this.render())
   }
 
@@ -341,7 +431,9 @@ export class HeightmapRenderer {
     const gl = this.gl
     if (this.vbo) gl.deleteBuffer(this.vbo)
     if (this.ibo) gl.deleteBuffer(this.ibo)
-    if (this.vao) gl.deleteVertexArray(this.vao)
-    if (this.program) gl.deleteProgram(this.program)
+    if (this.solidVao) gl.deleteVertexArray(this.solidVao)
+    if (this.wireVao) gl.deleteVertexArray(this.wireVao)
+    if (this.solidProgram) gl.deleteProgram(this.solidProgram.program)
+    if (this.wireProgram) gl.deleteProgram(this.wireProgram.program)
   }
 }

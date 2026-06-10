@@ -7,6 +7,18 @@ export class SonarSimulatorFrontend {
     this._numBeams = 128
     this._maxSwathAngle = 75.0
     this._baseDepth = 250.0
+    this._holeRegions = []
+    this._initHoleRegions()
+  }
+
+  _initHoleRegions() {
+    this._holeRegions = [
+      { centerAngle: -15, angleWidth: 25, yStart: 100, yEnd: 400 },
+      { centerAngle: 30, angleWidth: 20, yStart: 200, yEnd: 500 },
+      { centerAngle: -45, angleWidth: 15, yStart: 50, yEnd: 250 },
+      { centerAngle: 0, angleWidth: 40, yStart: 600, yEnd: 800 },
+      { centerAngle: 50, angleWidth: 18, yStart: 150, yEnd: 350 }
+    ]
   }
 
   start() {
@@ -31,6 +43,20 @@ export class SonarSimulatorFrontend {
     }, 100)
   }
 
+  _isInHole(beamAngle, shipY) {
+    for (let i = 0; i < this._holeRegions.length; i++) {
+      const hole = this._holeRegions[i]
+      const angleDist = Math.abs(beamAngle - hole.centerAngle)
+      if (angleDist < hole.angleWidth / 2 && shipY >= hole.yStart && shipY <= hole.yEnd) {
+        return true
+      }
+    }
+    if (Math.random() < 0.03) {
+      return true
+    }
+    return false
+  }
+
   _generateFrame() {
     const points = []
     const timestamp = Date.now()
@@ -41,6 +67,11 @@ export class SonarSimulatorFrontend {
 
     for (let i = 0; i < this._numBeams; i++) {
       const beamAngle = -this._maxSwathAngle + (2 * this._maxSwathAngle * i / (this._numBeams - 1))
+
+      if (this._isInHole(beamAngle, shipDriftY)) {
+        continue
+      }
+
       const beamAngleRad = beamAngle * Math.PI / 180
 
       let terrainVariation = 0
